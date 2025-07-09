@@ -1,139 +1,4 @@
-import json
-import difflib
-from jinja2 import Template
-from deepdiff import DeepDiff
 
-def format_json(obj):
-    return json.dumps(obj, indent=2, ensure_ascii=False, sort_keys=True).splitlines()
-
-def char_diff_html(left_line, right_line):
-    sm = difflib.SequenceMatcher(None, left_line, right_line)
-    left_result = ""
-    right_result = ""
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        l_chunk = left_line[i1:i2]
-        r_chunk = right_line[j1:j2]
-        if tag == "equal":
-            left_result += l_chunk
-            right_result += r_chunk
-        else:
-            left_result += f'<span style="background-color:#f8d7da;">{l_chunk}</span>'
-            right_result += f'<span style="background-color:#d4edda;">{r_chunk}</span>'
-    return left_result, right_result
-
-def generate_rows(left_lines, right_lines):
-    matcher = difflib.SequenceMatcher(None, left_lines, right_lines)
-    raw_rows = []
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == 'equal':
-            for l, r in zip(left_lines[i1:i2], right_lines[j1:j2]):
-                raw_rows.append({'left': l, 'right': r, 'status': 'equal'})
-        elif tag == 'replace':
-            max_len = max(i2 - i1, j2 - j1)
-            for i in range(max_len):
-                l = left_lines[i1 + i] if i1 + i < i2 else ""
-                r = right_lines[j1 + i] if j1 + i < j2 else ""
-                raw_rows.append({'left': l, 'right': r, 'status': 'changed'})
-        elif tag == 'delete':
-            for l in left_lines[i1:i2]:
-                raw_rows.append({'left': l, 'right': '', 'status': 'removed'})
-        elif tag == 'insert':
-            for r in right_lines[j1:j2]:
-                raw_rows.append({'left': '', 'right': r, 'status': 'added'})
-    return raw_rows
-
-def collapse_unchanged(rows, context=3):
-    result = []
-    buffer = []
-    def flush_buffer():
-        if len(buffer) <= 2 * context:
-            result.extend(buffer)
-        else:
-            result.extend(buffer[:context])
-            result.append({'left': '...', 'right': '...', 'status': 'collapsed'})
-            result.extend(buffer[-context:])
-        buffer.clear()
-
-    for row in rows:
-        if row['status'] == 'equal':
-            buffer.append(row)
-        else:
-            if buffer:
-                flush_buffer()
-            result.append(row)
-    if buffer:
-        flush_buffer()
-    return result
-
-def highlight_char_diffs(rows):
-    for row in rows:
-        if row['status'] in ('changed', 'removed', 'added'):
-            left_html, right_html = char_diff_html(row['left'], row['right'])
-            row['left'] = left_html
-            row['right'] = right_html
-    return rows
-
-# === 主流程 ===
-json1 = {
-    "id": 101,
-    "name": "Project A",
-    "status": "active",
-    "owner": {
-        "name": "Alice",
-        "email": "alice@example.com"
-    },
-    "tasks": [
-        {"id": 1, "title": "Design", "done": False},
-        {"id": 2, "title": "Development", "done": False}
-    ]
-}
-
-json2 = {
-    "id": 101,
-    "name": "Project Alpha",
-    "status": "archived",
-    "owner": {
-        "name": "Alice",
-        "email": "alice@company.com"
-    },
-    "tasks": [
-        {"id": 1, "title": "Design", "done": True},
-        {"id": 3, "title": "Testing", "done": False}
-    ],
-    "created_at": "2025-07-01"
-}
-
-# 格式化 JSON，忽略字段顺序
-left_lines = format_json(json1)
-right_lines = format_json(json2)
-
-# 生成左右对比行
-rows = generate_rows(left_lines, right_lines)
-
-# 折叠未变更大段
-rows = collapse_unchanged(rows, context=3)
-
-# 字符级高亮
-rows = highlight_char_diffs(rows)
-
-# 生成 DeepDiff 变化明细（路径、旧值、新值）
-raw_diff = DeepDiff(json1, json2, ignore_order=True, view='tree')
-
-change_details = []
-for change_type, changes in raw_diff.items():
-    for item in changes:
-        path = item.path(output_format='string') if hasattr(item, 'path') else str(item)
-        old_val = getattr(item, 't1', 'N/A')
-        new_val = getattr(item, 't2', 'N/A')
-        change_details.append({
-            'change_type': change_type,
-            'path': path,
-            'old_val': old_val,
-            'new_val': new_val
-        })
-
-# Jinja2 模板，左右对比 + 变化明细
-html_template = """
 <!DOCTYPE html>
 <html>
 <head>
@@ -168,36 +33,167 @@ function toggleCollapse(row) {
 <h2>change_details</h2>
 <table>
 <tr><th>原始 JSON</th><th>修改后 JSON</th></tr>
-{% for row in rows %}
-<tr class="{{ row.status }}" {% if row.status == 'collapsed' %} onclick="toggleCollapse(this)" {% endif %}>
-  <td>{{ row.left | safe }}</td>
-  <td>{{ row.right | safe }}</td>
+
+<tr class="equal" >
+  <td>{</td>
+  <td>{</td>
 </tr>
-{% endfor %}
+
+<tr class="added" >
+  <td><span style="background-color:#f8d7da;"></span></td>
+  <td><span style="background-color:#d4edda;">  "created_at": "2025-07-01",</span></td>
+</tr>
+
+<tr class="equal" >
+  <td>  "id": 101,</td>
+  <td>  "id": 101,</td>
+</tr>
+
+<tr class="changed" >
+  <td>  "name": "Project A<span style="background-color:#f8d7da;"></span>",</td>
+  <td>  "name": "Project A<span style="background-color:#d4edda;">lpha</span>",</td>
+</tr>
+
+<tr class="equal" >
+  <td>  "owner": {</td>
+  <td>  "owner": {</td>
+</tr>
+
+<tr class="changed" >
+  <td>    "email": "alice@<span style="background-color:#f8d7da;">exa</span>mp<span style="background-color:#f8d7da;">le</span>.com",</td>
+  <td>    "email": "alice@<span style="background-color:#d4edda;">co</span>mp<span style="background-color:#d4edda;">any</span>.com",</td>
+</tr>
+
+<tr class="equal" >
+  <td>    "name": "Alice"</td>
+  <td>    "name": "Alice"</td>
+</tr>
+
+<tr class="equal" >
+  <td>  },</td>
+  <td>  },</td>
+</tr>
+
+<tr class="changed" >
+  <td>  "status": "a<span style="background-color:#f8d7da;"></span>c<span style="background-color:#f8d7da;">t</span>ive<span style="background-color:#f8d7da;"></span>",</td>
+  <td>  "status": "a<span style="background-color:#d4edda;">r</span>c<span style="background-color:#d4edda;">h</span>ive<span style="background-color:#d4edda;">d</span>",</td>
+</tr>
+
+<tr class="equal" >
+  <td>  "tasks": [</td>
+  <td>  "tasks": [</td>
+</tr>
+
+<tr class="equal" >
+  <td>    {</td>
+  <td>    {</td>
+</tr>
+
+<tr class="changed" >
+  <td>      "done": <span style="background-color:#f8d7da;">fals</span>e,</td>
+  <td>      "done": <span style="background-color:#d4edda;">tru</span>e,</td>
+</tr>
+
+<tr class="equal" >
+  <td>      "id": 1,</td>
+  <td>      "id": 1,</td>
+</tr>
+
+<tr class="equal" >
+  <td>      "title": "Design"</td>
+  <td>      "title": "Design"</td>
+</tr>
+
+<tr class="equal" >
+  <td>    },</td>
+  <td>    },</td>
+</tr>
+
+<tr class="equal" >
+  <td>    {</td>
+  <td>    {</td>
+</tr>
+
+<tr class="equal" >
+  <td>      "done": false,</td>
+  <td>      "done": false,</td>
+</tr>
+
+<tr class="changed" >
+  <td>      "id": <span style="background-color:#f8d7da;">2</span>,</td>
+  <td>      "id": <span style="background-color:#d4edda;">3</span>,</td>
+</tr>
+
+<tr class="changed" >
+  <td>      "title": "<span style="background-color:#f8d7da;">D</span>e<span style="background-color:#f8d7da;">velopme</span>n<span style="background-color:#f8d7da;">t</span>"</td>
+  <td>      "title": "<span style="background-color:#d4edda;">T</span>e<span style="background-color:#d4edda;">sti</span>n<span style="background-color:#d4edda;">g</span>"</td>
+</tr>
+
+<tr class="equal" >
+  <td>    }</td>
+  <td>    }</td>
+</tr>
+
+<tr class="equal" >
+  <td>  ]</td>
+  <td>  ]</td>
+</tr>
+
+<tr class="equal" >
+  <td>}</td>
+  <td>}</td>
+</tr>
+
 </table>
 
 <h2>变化明细（DeepDiff）</h2>
 <div class="change-details">
 <table>
   <tr><th>变更类型</th><th>路径</th><th>旧值</th><th>新值</th></tr>
-  {% for c in change_details %}
+  
   <tr>
-    <td class="change-type">{{ c.change_type }}</td>
-    <td>{{ c.path }}</td>
-    <td>{{ c.old_val }}</td>
-    <td>{{ c.new_val }}</td>
+    <td class="change-type">values_changed</td>
+    <td>name</td>
+    <td>Project A</td>
+    <td>Project Alpha</td>
   </tr>
-  {% endfor %}
+  
+  <tr>
+    <td class="change-type">values_changed</td>
+    <td>status</td>
+    <td>active</td>
+    <td>archived</td>
+  </tr>
+  
+  <tr>
+    <td class="change-type">values_changed</td>
+    <td>owner.email</td>
+    <td>alice@example.com</td>
+    <td>alice@company.com</td>
+  </tr>
+  
+  <tr>
+    <td class="change-type">values_changed</td>
+    <td>tasks[0]</td>
+    <td>{'id': 1, 'title': 'Design', 'done': False}</td>
+    <td>{'id': 1, 'title': 'Design', 'done': True}</td>
+  </tr>
+  
+  <tr>
+    <td class="change-type">values_changed</td>
+    <td>tasks[1]</td>
+    <td>{'id': 2, 'title': 'Development', 'done': False}</td>
+    <td>{'id': 3, 'title': 'Testing', 'done': False}</td>
+  </tr>
+  
+  <tr>
+    <td class="change-type">dictionary_item_added</td>
+    <td>created_at</td>
+    <td>not present</td>
+    <td>2025-07-01</td>
+  </tr>
+  
 </table>
 </div>
 </body>
 </html>
-"""
-
-template = Template(html_template)
-html = template.render(rows=rows, change_details=change_details)
-
-with open("json_diff_with_details.html", "w", encoding="utf-8") as f:
-    f.write(html)
-
-print("✅ saved：json_diff_with_details.html")
