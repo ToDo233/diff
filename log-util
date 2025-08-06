@@ -1,35 +1,91 @@
 import logging
 import os
+import json
 import pytest
+import requests
+from functools import wraps
 
-# 日志输出目录
-LOG_DIR = "logs"
-os.makedirs(LOG_DIR, exist_ok=True)
+BASE_LOG_DIR = "logs"
+CASE_LOG_MAP = {}  # nodeid -> log path
+CASE_HTTP_LOG_MAP = {}  # nodeid -> http log path
 
-# 保存 case 顺序编号映射
-CASE_LOG_MAP = {}
-
-# 第一步：收集顺序并编号
+# -------- 1. 收集用例顺序 & 准备日志路径 --------
 def pytest_collection_modifyitems(session, config, items):
-    for idx, item in enumerate(items, start=1):
-        CASE_LOG_MAP[item.nodeid] = f"case{idx}.log"
-    # 按源码中定义顺序排序
+    file_case_count = {}
+
     items.sort(key=lambda item: item.function.__code__.co_firstlineno)
 
-# 第二步：测试前设置 logger
+    for item in items:
+        file_path = item.location[0]
+        file_name = os.path.splitext(os.path.basename(file_path))[0]
+
+        file_case_count[file_name] = file_case_count.get(file_name, 0) + 1
+        case_num = file_case_count[file_name]
+
+        # case log
+        log_dir = os.path.join(BASE_LOG_DIR, file_name)
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f"case{case_num}.log")
+        http_log_file = os.path.join(log_dir, f"case{case_num}_http.json")
+
+        CASE_LOG_MAP[item.nodeid] = log_file
+        CASE_HTTP_LOG_MAP[item.nodeid] = http_log_file
+
+# -------- 2. 设置普通日志 --------
 def pytest_runtest_setup(item):
-    log_file_name = CASE_LOG_MAP.get(item.nodeid)
-    log_path = os.path.join(LOG_DIR, log_file_name)
+    log_path = CASE_LOG_MAP.get(item.nodeid)
 
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
 
-    # 清空旧的 handler（防止多次添加）
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
 
-    # 设置新的 handler
     fh = logging.FileHandler(log_path, mode='w', encoding='utf-8')
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     fh.setFormatter(formatter)
-    root_logger.addHandler(fh)
+    logger.addHandler(fh)
+
+# -------- 3. 请求响应日志捕获 fixture（自动启用） --------
+@pytest.fixture(autouse=True)
+def capture_http(monkeypatch, request):
+    logs = []
+
+    original_request = requests.Session.request
+
+    @wraps(original_request)
+    def wrapped_request(self, method, url, **kwargs):
+        entry = {
+            "request": {
+                "method": method,
+                "url": url,
+                "headers": dict(kwargs.get("headers", {})),
+                "params": kwargs.get("params"),
+                "json": kwargs.get("json"),
+                "data": kwargs.get("data"),
+            }
+        }
+        response = original_request(self, method, url, **kwargs)
+        entry["response"] = {
+            "status_code": response.status_code,
+            "headers": dict(response.headers),
+            "body": safe_text(response),
+        }
+        logs.append(entry)
+        return response
+
+    monkeypatch.setattr(requests.Session, "request", wrapped_request)
+
+    yield  # 等待用例执行完
+
+    # 保存到 JSON 文件
+    http_log_path = CASE_HTTP_LOG_MAP.get(request.node.nodeid)
+    with open(http_log_path, "w", encoding="utf-8") as f:
+        json.dump(logs, f, indent=2, ensure_ascii=False)
+
+# -------- 工具函数：处理响应体文本 --------
+def safe_text(resp):
+    try:
+        return resp.text
+    except Exception:
+        return "<binary>"
