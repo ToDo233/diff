@@ -194,3 +194,20 @@ def pytest_runtest_setup(item):
     patch_pynamodb_methods(case_dir)
     patch_transactwrite(case_dir)
     find_and_wrap_lambda(item)
+
+def patched_transact_write_items(self, *args, **kwargs):
+    case_dir = getattr(_thread_local, "case_dir", None)
+    if case_dir:
+        # 事务开始前快照，示例简单写日志
+        with open(os.path.join(case_dir, "transaction.log"), "a", encoding="utf-8") as f:
+            f.write(f"TransactWrite called with args: {args} kwargs: {kwargs}\n")
+
+    # 调用原事务方法
+    result = original_transact_write_items(self, *args, **kwargs)
+
+    if case_dir:
+        # 事务结束后也可以保存快照
+        with open(os.path.join(case_dir, "transaction.log"), "a", encoding="utf-8") as f:
+            f.write("TransactWrite completed successfully\n")
+
+    return result
