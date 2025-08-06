@@ -1,0 +1,29 @@
+import logging
+import os
+import pytest
+
+LOG_DIR = "logs"
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item):
+    """在每个测试用例开始前设置日志"""
+    if not os.path.exists(LOG_DIR):
+        os.makedirs(LOG_DIR)
+
+    test_name = item.name
+    log_path = os.path.join(LOG_DIR, f"{test_name}.log")
+
+    # 设置 root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+
+    # 清除旧的 handler（避免重复日志）
+    for h in root_logger.handlers[:]:
+        root_logger.removeHandler(h)
+
+    # 添加 file handler
+    fh = logging.FileHandler(log_path, mode='w', encoding='utf-8')
+    fh.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    root_logger.addHandler(fh)
