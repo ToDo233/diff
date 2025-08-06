@@ -149,4 +149,7 @@ def pytest_runtest_setup(item):
     # 设置日志、patch DB、patch handler
     setup_logger(case_dir)
     patch_pynamodb_methods(case_dir)
-    patch_all_lambdas()
+        # 动态抓取被测 lambda module
+    for mod in sys.modules.values():
+        if hasattr(mod, "lambda_handler") and not getattr(mod.lambda_handler, "_is_wrapped", False):
+            wrap_lambda_handler(mod)
