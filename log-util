@@ -93,3 +93,78 @@ def safe_text(resp):
         return resp.text
     except Exception:
         return "<binary>"
+
+
+# 快照保存路径
+CASE_PYNAMODB_DIR_MAP = {}
+
+# Hook pynamodb 方法
+def patch_pynamodb_methods(snapshot_dir):
+
+    def save_hook(self, *args, **kwargs):
+        before = None
+        try:
+            self.refresh()
+            before = self.attribute_values
+        except Exception:
+            pass  # new item
+
+        result = original_save(self, *args, **kwargs)
+
+        after = self.attribute_values
+        save_snapshot(snapshot_dir, "save", self.__class__.__name__, before, after)
+        return result
+
+    def delete_hook(self, *args, **kwargs):
+        try:
+            before = self.attribute_values
+        except Exception:
+            before = None
+
+        result = original_delete(self, *args, **kwargs)
+        save_snapshot(snapshot_dir, "delete", self.__class__.__name__, before, None)
+        return result
+
+    def update_hook(self, *args, **kwargs):
+        before = None
+        try:
+            self.refresh()
+            before = self.attribute_values
+        except Exception:
+            pass
+
+        result = original_update(self, *args, **kwargs)
+        after = self.attribute_values
+        save_snapshot(snapshot_dir, "update", self.__class__.__name__, before, after)
+        return result
+
+    def save_snapshot(path, op, model_name, before, after):
+        snap = {
+            "op": op,
+            "model": model_name,
+            "before": before,
+            "after": after,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        fname = os.path.join(path, f"pynamodb_{uuid.uuid4().hex}.json")
+        with open(fname, "w", encoding="utf-8") as f:
+            json.dump(snap, f, indent=2, default=str)
+
+    # Monkey patch methods
+    global original_save, original_delete, original_update
+    original_save = Model.save
+    original_delete = Model.delete
+    original_update = Model.update
+
+    Model.save = save_hook
+    Model.delete = delete_hook
+    Model.update = update_hook
+
+# hook 所在用例路径
+def pytest_runtest_setup(item):
+    case_dir = CASE_DIR_MAP.get(item.nodeid)
+    pynamodb_snap_dir = os.path.join(case_dir, "pynamodb")
+    os.makedirs(pynamodb_snap_dir, exist_ok=True)
+    CASE_PYNAMODB_DIR_MAP[item.nodeid] = pynamodb_snap_dir
+
+    patch_pynamodb_methods(pynamodb_snap_dir)
