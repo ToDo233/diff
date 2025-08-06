@@ -5,12 +5,14 @@ import json
 import logging
 import inspect
 import shutil
-from pathlib import Path
 import pytest
+import importlib
+from pathlib import Path
 from functools import wraps
 from pynamodb.models import Model
+from pynamodb.transactions import TransactWrite
 
-# ========= 控制开关 ============
+# ========== 控制开关 ==========
 ENABLE_CRUD_CAPTURE = False
 
 def enable_crud():
@@ -21,7 +23,7 @@ def disable_crud():
     global ENABLE_CRUD_CAPTURE
     ENABLE_CRUD_CAPTURE = False
 
-# ========= 快照保存 ============
+# ========== 快照保存 ==========
 def save_snapshot(op, model_name, before, after, case_dir):
     if not ENABLE_CRUD_CAPTURE:
         return
@@ -39,7 +41,7 @@ def save_snapshot(op, model_name, before, after, case_dir):
     with open(fname, "w") as f:
         json.dump(data, f, indent=2)
 
-# ========= patch PynamoDB ============
+# ========== Patch PynamoDB ==========
 def patch_pynamodb_methods(case_dir):
     def safe_copy(obj):
         try:
@@ -68,49 +70,89 @@ def patch_pynamodb_methods(case_dir):
         save_snapshot("update", self.__class__.__name__, before, after, case_dir)
         return result
 
-    original_save = Model.save
-    original_delete = Model.delete
-    original_update = Model.update
-
     Model.save = patched_save
     Model.delete = patched_delete
     Model.update = patched_update
 
-# ========= patch lambda_handler ============
+# ========== Patch TransactWrite ==========
+def patch_transactwrite(case_dir):
+    if getattr(TransactWrite, "_patched", False):
+        return
+
+    original_save = TransactWrite.save
+    original_delete = TransactWrite.delete
+
+    def safe_copy(model):
+        try:
+            model.refresh()
+            return model.attribute_values.copy()
+        except Exception:
+            return None
+
+    def wrapped_save(self, model, *args, **kwargs):
+        before = safe_copy(model)
+        result = original_save(self, model, *args, **kwargs)
+        after = model.attribute_values.copy()
+        save_snapshot("tx_save", model.__class__.__name__, before, after, case_dir)
+        return result
+
+    def wrapped_delete(self, model, *args, **kwargs):
+        before = safe_copy(model)
+        result = original_delete(self, model, *args, **kwargs)
+        save_snapshot("tx_delete", model.__class__.__name__, before, None, case_dir)
+        return result
+
+    TransactWrite.save = wrapped_save
+    TransactWrite.delete = wrapped_delete
+    TransactWrite._patched = True
+
+# ========== Patch lambda_handler ==========
 def wrap_lambda_handler(module):
     if not hasattr(module, "lambda_handler"):
         return
 
     original = module.lambda_handler
-
     if getattr(original, "_is_wrapped", False):
         return
 
     @wraps(original)
     def wrapped(event, context):
         enable_crud()
+        case_dir = getattr(context, "_case_dir", ".")
         try:
-            return original(event, context)
+            save_json(os.path.join(case_dir, "request.json"), event)
+            result = original(event, context)
+            save_json(os.path.join(case_dir, "response.json"), result)
+            return result
         finally:
             disable_crud()
 
     wrapped._is_wrapped = True
     module.lambda_handler = wrapped
 
-def patch_all_lambdas():
-    for name, module in sys.modules.items():
-        if name.startswith("lambdas."):
-            wrap_lambda_handler(module)
+# ========== 查找并 wrap 被测模块 ==========
+def find_and_wrap_lambda(item):
+    func = item.function
+    code = inspect.getsource(func)
 
-# ========= 日志 ============
+    for line in code.splitlines():
+        if "import" in line and "lambda_handler" in line:
+            parts = line.strip().split()
+            if "from" in parts:
+                try:
+                    module_path = parts[parts.index("from") + 1]
+                    mod = importlib.import_module(module_path)
+                    wrap_lambda_handler(mod)
+                except Exception as e:
+                    print(f"❌ Failed to import {module_path}: {e}")
+
+# ========== 日志 ==========
 def setup_logger(case_dir):
     log_file = os.path.join(case_dir, "lambda_handler.log")
     os.makedirs(case_dir, exist_ok=True)
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-
-    # 清除旧 handler，避免重复输出
     while logger.handlers:
         logger.handlers.pop()
 
@@ -119,37 +161,36 @@ def setup_logger(case_dir):
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
-# ========= 测试用例排序（按代码顺序） ============
+# ========== 保存请求响应 ==========
+def save_json(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logging.warning(f"Failed to save json to {path}: {e}")
+
+# ========== 用例排序 ==========
 def pytest_collection_modifyitems(session, config, items):
     items.sort(key=lambda item: item.function.__code__.co_firstlineno)
 
 def get_case_index(item):
     current_file = item.fspath
-    all_items = [
-        it for it in item.session.items
-        if it.fspath == current_file
-    ]
+    all_items = [it for it in item.session.items if it.fspath == current_file]
     sorted_items = sorted(all_items, key=lambda it: it.function.__code__.co_firstlineno)
     return sorted_items.index(item) + 1
 
-
-# ========= 为每个用例设置独立 log + patch ============
+# ========== 每个测试前设置 ==========
 def pytest_runtest_setup(item):
-    # 创建 logs/目录结构
     test_file = Path(item.fspath).stem
     case_index = get_case_index(item)
     case_dir = os.path.join("logs", test_file, f"case{case_index}")
     item.case_dir = case_dir
 
-    # 重建目录（干净）
     if os.path.exists(case_dir):
         shutil.rmtree(case_dir)
     os.makedirs(case_dir)
 
-    # 设置日志、patch DB、patch handler
     setup_logger(case_dir)
     patch_pynamodb_methods(case_dir)
-        # 动态抓取被测 lambda module
-    for mod in sys.modules.values():
-        if hasattr(mod, "lambda_handler") and not getattr(mod.lambda_handler, "_is_wrapped", False):
-            wrap_lambda_handler(mod)
+    patch_transactwrite(case_dir)
+    find_and_wrap_lambda(item)
