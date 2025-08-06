@@ -123,11 +123,21 @@ def setup_logger(case_dir):
 def pytest_collection_modifyitems(session, config, items):
     items.sort(key=lambda item: item.function.__code__.co_firstlineno)
 
+def get_case_index(item):
+    current_file = item.fspath
+    all_items = [
+        it for it in item.session.items
+        if it.fspath == current_file
+    ]
+    sorted_items = sorted(all_items, key=lambda it: it.function.__code__.co_firstlineno)
+    return sorted_items.index(item) + 1
+
+
 # ========= 为每个用例设置独立 log + patch ============
 def pytest_runtest_setup(item):
     # 创建 logs/目录结构
     test_file = Path(item.fspath).stem
-    case_index = item.parent.items.index(item) + 1
+    case_index = get_case_index(item)
     case_dir = os.path.join("logs", test_file, f"case{case_index}")
     item.case_dir = case_dir
 
