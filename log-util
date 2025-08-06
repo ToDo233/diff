@@ -1,152 +1,142 @@
 import os
 import sys
-import json
 import uuid
-import pytest
+import json
 import logging
-import contextlib
+import inspect
+import shutil
 from pathlib import Path
-from datetime import datetime
+import pytest
+from functools import wraps
 from pynamodb.models import Model
 
-# ========== 全局配置 ==========
-BASE_LOG_DIR = Path("logs").absolute()
-CASE_LOG_MAP = {}
-CASE_DIR_MAP = {}
+# ========= 控制开关 ============
 ENABLE_CRUD_CAPTURE = False
-PATCHED_FLAG = False
-original_save = None
-original_delete = None
-original_update = None
 
-# ========== 控制 CRUD 快照上下文 ==========
-@contextlib.contextmanager
-def enable_crud_capture():
+def enable_crud():
     global ENABLE_CRUD_CAPTURE
     ENABLE_CRUD_CAPTURE = True
-    try:
-        yield
-    finally:
-        ENABLE_CRUD_CAPTURE = False
 
-# ========== 保存 CRUD 快照 ==========
+def disable_crud():
+    global ENABLE_CRUD_CAPTURE
+    ENABLE_CRUD_CAPTURE = False
+
+# ========= 快照保存 ============
 def save_snapshot(op, model_name, before, after, case_dir):
     if not ENABLE_CRUD_CAPTURE:
         return
-    snap = {
-        "op": op,
+
+    pynamodb_dir = os.path.join(case_dir, "pynamodb")
+    os.makedirs(pynamodb_dir, exist_ok=True)
+
+    data = {
+        "operation": op,
         "model": model_name,
         "before": before,
-        "after": after,
-        "timestamp": datetime.utcnow().isoformat()
+        "after": after
     }
-    folder = os.path.join(case_dir, "pynamodb")
-    os.makedirs(folder, exist_ok=True)
-    fname = os.path.join(folder, f"{op}_{uuid.uuid4().hex}.json")
-    with open(fname, "w", encoding="utf-8") as f:
-        json.dump(snap, f, indent=2, default=str)
+    fname = os.path.join(pynamodb_dir, f"{uuid.uuid4()}.json")
+    with open(fname, "w") as f:
+        json.dump(data, f, indent=2)
 
-# ========== 打补丁：pynamodb 方法 ==========
+# ========= patch PynamoDB ============
 def patch_pynamodb_methods(case_dir):
-    global PATCHED_FLAG, original_save, original_delete, original_update
-    if PATCHED_FLAG:
-        return
-    PATCHED_FLAG = True
+    def safe_copy(obj):
+        try:
+            obj.refresh()
+            return obj.attribute_values.copy()
+        except Exception:
+            return None
 
-    original_save = Model.save
-    original_delete = Model.delete
-    original_update = Model.update
-
-    def save_hook(self, *args, **kwargs):
+    def patched_save(self, *args, **kwargs):
         before = safe_copy(self)
         result = original_save(self, *args, **kwargs)
-        after = safe_copy(self)
+        after = self.attribute_values.copy()
         save_snapshot("save", self.__class__.__name__, before, after, case_dir)
         return result
 
-    def delete_hook(self, *args, **kwargs):
+    def patched_delete(self, *args, **kwargs):
         before = safe_copy(self)
         result = original_delete(self, *args, **kwargs)
         save_snapshot("delete", self.__class__.__name__, before, None, case_dir)
         return result
 
-    def update_hook(self, *args, **kwargs):
+    def patched_update(self, *args, **kwargs):
         before = safe_copy(self)
         result = original_update(self, *args, **kwargs)
-        after = safe_copy(self)
+        after = self.attribute_values.copy()
         save_snapshot("update", self.__class__.__name__, before, after, case_dir)
         return result
 
-    Model.save = save_hook
-    Model.delete = delete_hook
-    Model.update = update_hook
+    original_save = Model.save
+    original_delete = Model.delete
+    original_update = Model.update
 
-def safe_copy(obj):
-    try:
-        obj.refresh()
-        return obj.attribute_values.copy()
-    except Exception:
-        return None
+    Model.save = patched_save
+    Model.delete = patched_delete
+    Model.update = patched_update
 
-# ========== 日志设置 ==========
-def setup_logging(log_path):
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    try:
-        fh = logging.FileHandler(log_path, mode='w', encoding='utf-8')
-        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-        fh.setFormatter(formatter)
-        logger.addHandler(fh)
-    except PermissionError:
-        raise RuntimeError(f"写日志失败，请检查权限：{log_path}")
-
-# ========== 自动 patch lambdas.do_test_logic ==========
-def wrap_do_test_logic(module, case_dir):
-    if not hasattr(module, "do_test_logic"):
+# ========= patch lambda_handler ============
+def wrap_lambda_handler(module):
+    if not hasattr(module, "lambda_handler"):
         return
-    original = module.do_test_logic
+
+    original = module.lambda_handler
 
     if getattr(original, "_is_wrapped", False):
         return
 
-    def wrapped(*args, **kwargs):
-        with enable_crud_capture():
-            return original(*args, **kwargs)
+    @wraps(original)
+    def wrapped(event, context):
+        enable_crud()
+        try:
+            return original(event, context)
+        finally:
+            disable_crud()
 
     wrapped._is_wrapped = True
-    module.do_test_logic = wrapped
+    module.lambda_handler = wrapped
 
-def patch_all_lambdas(case_dir):
+def patch_all_lambdas():
     for name, module in sys.modules.items():
-        if not name.startswith("lambdas."):
-            continue
-        wrap_do_test_logic(module, case_dir)
+        if name.startswith("lambdas."):
+            wrap_lambda_handler(module)
 
-# ========== Pytest Hook：排序 & 路径准备 ==========
+# ========= 日志 ============
+def setup_logger(case_dir):
+    log_file = os.path.join(case_dir, "lambda_handler.log")
+    os.makedirs(case_dir, exist_ok=True)
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+
+    # 清除旧 handler，避免重复输出
+    while logger.handlers:
+        logger.handlers.pop()
+
+    handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+# ========= 测试用例排序（按代码顺序） ============
 def pytest_collection_modifyitems(session, config, items):
-    file_case_count = {}
     items.sort(key=lambda item: item.function.__code__.co_firstlineno)
 
-    for item in items:
-        file_path = item.location[0]
-        file_name = os.path.splitext(os.path.basename(file_path))[0]
-        file_case_count[file_name] = file_case_count.get(file_name, 0) + 1
-        case_num = file_case_count[file_name]
-
-        case_dir = os.path.join(BASE_LOG_DIR, file_name, f"case{case_num}")
-        os.makedirs(case_dir, exist_ok=True)
-        CASE_DIR_MAP[item.nodeid] = case_dir
-        CASE_LOG_MAP[item.nodeid] = os.path.join(case_dir, "log.log")
-
-# ========== 每个用例前，设置日志 & patch ==========
-@pytest.hookimpl(tryfirst=True)
+# ========= 为每个用例设置独立 log + patch ============
 def pytest_runtest_setup(item):
-    nodeid = item.nodeid
-    case_dir = CASE_DIR_MAP.get(nodeid)
-    log_path = CASE_LOG_MAP.get(nodeid)
+    # 创建 logs/目录结构
+    test_file = Path(item.fspath).stem
+    case_index = item.parent.items.index(item) + 1
+    case_dir = os.path.join("logs", test_file, f"case{case_index}")
+    item.case_dir = case_dir
 
-    setup_logging(log_path)
+    # 重建目录（干净）
+    if os.path.exists(case_dir):
+        shutil.rmtree(case_dir)
+    os.makedirs(case_dir)
+
+    # 设置日志、patch DB、patch handler
+    setup_logger(case_dir)
     patch_pynamodb_methods(case_dir)
-    patch_all_lambdas(case_dir)
+    patch_all_lambdas()
