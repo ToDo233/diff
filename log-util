@@ -195,19 +195,47 @@ def pytest_runtest_setup(item):
     patch_transactwrite(case_dir)
     find_and_wrap_lambda(item)
 
-def patched_transact_write_items(self, *args, **kwargs):
-    case_dir = getattr(_thread_local, "case_dir", None)
-    if case_dir:
-        # 事务开始前快照，示例简单写日志
-        with open(os.path.join(case_dir, "transaction.log"), "a", encoding="utf-8") as f:
-            f.write(f"TransactWrite called with args: {args} kwargs: {kwargs}\n")
+def patch_pynamodb_transactions(snapshot_dir):
+    if getattr(TransactWrite.commit, "_patched", False):
+        return
 
-    # 调用原事务方法
-    result = original_transact_write_items(self, *args, **kwargs)
+    def snapshot_commit(original_commit, instance, name):
+        def wrapper(*args, **kwargs):
+            # 保存请求
+            before = {
+                "operation": name,
+                "request_items": getattr(instance, "_transact_items", []),
+                "timestamp": datetime.utcnow().isoformat()
+            }
 
-    if case_dir:
-        # 事务结束后也可以保存快照
-        with open(os.path.join(case_dir, "transaction.log"), "a", encoding="utf-8") as f:
-            f.write("TransactWrite completed successfully\n")
+            before_path = os.path.join(snapshot_dir, "pynamodb", f"{name}_before_{uuid.uuid4().hex}.json")
+            os.makedirs(os.path.dirname(before_path), exist_ok=True)
+            with open(before_path, "w", encoding="utf-8") as f:
+                json.dump(before, f, indent=2, default=str)
 
-    return result
+            result = original_commit(instance, *args, **kwargs)
+
+            # 保存响应
+            after = {
+                "operation": name,
+                "response": str(result),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+
+            after_path = os.path.join(snapshot_dir, "pynamodb", f"{name}_after_{uuid.uuid4().hex}.json")
+            with open(after_path, "w", encoding="utf-8") as f:
+                json.dump(after, f, indent=2, default=str)
+
+            return result
+        return wrapper
+
+    TransactWrite.commit = snapshot_commit(TransactWrite.commit, TransactWrite, "TransactWrite")
+    TransactWrite.commit._patched = True
+
+    TransactGet.commit = snapshot_commit(TransactGet.commit, TransactGet, "TransactGet")
+    TransactGet.commit._patched = True
+
+
+ # 打补丁
+    patch_pynamodb_methods(case_dir)
+    patch_pynamodb_transactions(case_dir)  # <-- 添加这行
