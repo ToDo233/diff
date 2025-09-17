@@ -1,0 +1,53 @@
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class ConcurrentIdGenerator {
+
+    private volatile String lastTimestamp = "";
+    private AtomicInteger counter = new AtomicInteger(0);
+    private final Object lock = new Object();
+
+    private static final int MAX_SEQ = 9999;
+
+    // 获取 n 个 ID
+    public List<String> getIds(int n) {
+        List<String> ids = new ArrayList<>(n);
+        String currentSecond = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"));
+
+        // 如果秒变化，重置计数器
+        if (!currentSecond.equals(lastTimestamp)) {
+            synchronized (lock) {
+                if (!currentSecond.equals(lastTimestamp)) {
+                    lastTimestamp = currentSecond;
+                    counter.set(0);
+                }
+            }
+        }
+
+        for (int i = 0; i < n; i++) {
+            int seq = counter.incrementAndGet();
+            if (seq > MAX_SEQ) {
+                // 超过最大序号，等待下一秒
+                while (true) {
+                    currentSecond = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"));
+                    if (!currentSecond.equals(lastTimestamp)) {
+                        synchronized (lock) {
+                            if (!currentSecond.equals(lastTimestamp)) {
+                                lastTimestamp = currentSecond;
+                                counter.set(0);
+                                seq = counter.incrementAndGet();
+                                break;
+                            }
+                        }
+                    }
+                    Thread.yield(); // 等待时间流逝
+                }
+            }
+            ids.add(currentSecond + "-" + String.format("%04d", seq));
+        }
+        return ids;
+    }
+}
