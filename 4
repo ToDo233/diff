@@ -1,0 +1,68 @@
+def generate_diff_sql(pk, columns, table_a, table_b, hash_col="HASH", hash_algo="SHA256"):
+    """
+    生成用于比较 table_a (新) 与 table_b (旧, 含 hash 列) 的 Oracle SQL
+    返回：SQL 字符串
+    参数：
+      pk        - 主键列名 (字符串)
+      columns   - 要比较的列名列表 (列表 of 字符串)
+      table_a   - 新表名 (字符串)
+      table_b   - 旧表名 (字符串)
+      hash_col  - B 表的 hash 列名 (默认 "HASH")
+      hash_algo - STANDARD_HASH 使用的算法 (默认 'SHA256')
+    """
+    if not columns:
+        raise ValueError("columns 不能为空")
+
+    # 生成 null-safe 的列比较表达式
+    def cmp_expr(col):
+        return (
+            f"((a.{col} IS NULL AND b.{col} IS NOT NULL) OR "
+            f"(a.{col} IS NOT NULL AND b.{col} IS NULL) OR "
+            f"(a.{col} <> b.{col}))"
+        )
+
+    # 生成用于计算 a 表实时 hash 的表达式（把每列都用 NVL(TO_CHAR(...), '#NULL#') 拼接）
+    hash_expr = " || ".join([f"NVL(TO_CHAR(a.{col}), '#NULL#')" for col in columns])
+
+    # 为每列生成两个 CASE 列（col_name_i, new_val_i）
+    select_parts = []
+    for i, col in enumerate(columns):
+        select_parts.append(f"CASE WHEN {cmp_expr(col)} THEN '{col}' END AS col_name_{i}")
+        select_parts.append(f"CASE WHEN {cmp_expr(col)} THEN TO_CHAR(a.{col}) END AS new_val_{i}")
+
+    select_cols = ",\n           ".join(select_parts)
+
+    # UNPIVOT 的 IN 列表，需要为每个元组指定别名
+    unpivot_items = [f"(col_name_{i}, new_val_{i}) AS col_{i}" for i in range(len(columns))]
+    unpivot_in = ",\n      ".join(unpivot_items)
+
+    sql = f"""SELECT {pk},
+       LISTAGG(col_name, '|') WITHIN GROUP (ORDER BY col_name) AS diff_columns,
+       LISTAGG(new_val, '|') WITHIN GROUP (ORDER BY col_name) AS diff_values
+FROM (
+  -- 先选出每个记录对应的所有 CASE 列 (col_name_i, new_val_i)
+  SELECT {pk}, col_name, new_val
+  FROM (
+    SELECT a.{pk},
+           {select_cols}
+    FROM {table_a} a
+    JOIN {table_b} b ON a.{pk} = b.{pk}
+    WHERE b.{hash_col} <> STANDARD_HASH({hash_expr}, '{hash_algo}')
+  )
+  UNPIVOT (
+    (col_name, new_val) FOR col_pair IN (
+      {unpivot_in}
+    )
+  )
+) t
+WHERE col_name IS NOT NULL
+GROUP BY {pk}
+"""
+    return sql
+
+
+# 测试 / 示例用法
+if __name__ == "__main__":
+    pk = "ID"
+    cols = ["NAME", "AGE", "ADDRESS"]
+    print(generate_diff_sql(pk, cols, "TABLE_A", "TABLE_B", hash_col="HASH"))
