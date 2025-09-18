@@ -1,0 +1,61 @@
+def generate_diff_sql(pk: str, columns: list, table_a: str, table_b: str, hash_col="HASH"):
+    """
+    生成 Oracle 差分对比 SQL
+    - pk: 主键字段名
+    - columns: 需要对比的列名列表
+    - table_a: 新数据表
+    - table_b: 旧数据表
+    - hash_col: B表中存储hash的列名
+    """
+
+    # hash 计算表达式 (拼接所有列)
+    hash_expr = " || ".join([f"NVL(TO_CHAR(a.{col}), '#NULL#')" for col in columns])
+
+    # CASE 语句生成
+    col_cases = []
+    val_cases = []
+    for col in columns:
+        col_cases.append(f"CASE WHEN a.{col} <> b.{col} THEN '{col}' END")
+        val_cases.append(f"CASE WHEN a.{col} <> b.{col} THEN TO_CHAR(a.{col}) END")
+
+    # 展开成列
+    select_cols = ",\n               ".join(
+        [f"{expr} AS col_name_{i}, {val_cases[i]} AS new_val_{i}" for i, expr in enumerate(col_cases)]
+    )
+
+    # 生成 SQL
+    sql = f"""
+    SELECT {pk},
+           LISTAGG(col_name, '|') WITHIN GROUP (ORDER BY col_name) AS diff_columns,
+           LISTAGG(new_val, '|') WITHIN GROUP (ORDER BY col_name) AS diff_values
+    FROM (
+        SELECT a.{pk},
+               UNPIVOT(
+                   (col_name, new_val) FOR col IN (
+                       {", ".join([f"(col_name_{i}, new_val_{i})" for i in range(len(columns))])}
+                   )
+               )
+        FROM (
+            SELECT a.{pk},
+                   {select_cols}
+            FROM {table_a} a
+            JOIN {table_b} b ON a.{pk} = b.{pk}
+            WHERE b.{hash_col} <> STANDARD_HASH({hash_expr}, 'SHA256')
+        )
+    ) t
+    WHERE col_name IS NOT NULL
+    GROUP BY {pk}
+    """
+
+    return sql.strip()
+
+
+# 示例用法
+if __name__ == "__main__":
+    pk = "ID"
+    columns = ["NAME", "AGE", "ADDRESS"]
+    table_a = "TABLE_A"
+    table_b = "TABLE_B"
+
+    sql = generate_diff_sql(pk, columns, table_a, table_b)
+    print(sql)
