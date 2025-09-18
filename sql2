@@ -1,0 +1,50 @@
+def generate_diff_sql(pk: str, columns: list, table_a="TABLE_A", table_b="TABLE_B", hash_col="HASH"):
+    """
+    生成 Oracle 差分对比 SQL
+    - pk: 主键字段名
+    - columns: 需要对比的列名列表
+    - table_a: 新数据表
+    - table_b: 旧数据表
+    - hash_col: B表中存储hash的列名
+    """
+
+    # 拼接 hash 计算表达式 (A表)
+    hash_expr = " || ".join([f"NVL(TO_CHAR(a.{col}), '#NULL#')" for col in columns])
+
+    # 针对每个列生成 SELECT 语句
+    union_parts = []
+    for col in columns:
+        sql_part = f"""
+        SELECT a.{pk} AS {pk},
+               '{col}' AS col_name,
+               TO_CHAR(a.{col}) AS new_val
+        FROM {table_a} a
+        JOIN {table_b} b ON a.{pk} = b.{pk}
+        WHERE b.{hash_col} <> STANDARD_HASH({hash_expr}, 'SHA256')
+          AND a.{col} <> b.{col}
+        """
+        union_parts.append(sql_part.strip())
+
+    # 拼接 UNION ALL
+    union_sql = "\nUNION ALL\n".join(union_parts)
+
+    # 最外层 LISTAGG 聚合
+    final_sql = f"""
+    SELECT {pk},
+           LISTAGG(col_name, '|') WITHIN GROUP (ORDER BY col_name) AS diff_columns,
+           LISTAGG(new_val, '|') WITHIN GROUP (ORDER BY col_name) AS diff_values
+    FROM (
+        {union_sql}
+    )
+    GROUP BY {pk}
+    """
+
+    return final_sql.strip()
+
+
+# 示例用法
+if __name__ == "__main__":
+    pk = "ID"
+    columns = ["NAME", "AGE", "ADDRESS"]
+    sql = generate_diff_sql(pk, columns)
+    print(sql)
