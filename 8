@@ -1,0 +1,56 @@
+@Component
+public class CsvMergeStepListener implements StepExecutionListener {
+
+    private String mergeDir;
+
+    @Override
+    public void beforeStep(StepExecution stepExecution) {
+        // 从 JobParameters 取出目录路径
+        JobParameters jobParameters = stepExecution.getJobParameters();
+        this.mergeDir = jobParameters.getString("mergeDir");
+    }
+
+    @Override
+    public ExitStatus afterStep(StepExecution stepExecution) {
+        if (mergeDir == null) {
+            return ExitStatus.FAILED;
+        }
+
+        try {
+            mergeCsvFiles(mergeDir);
+        } catch (IOException e) {
+            e.printStackTrace();
+            return ExitStatus.FAILED;
+        }
+
+        return ExitStatus.COMPLETED;
+    }
+
+    private void mergeCsvFiles(String dirPath) throws IOException {
+        Path dir = Paths.get(dirPath);
+        Path mergedFile = dir.resolve("merged.csv");
+
+        try (BufferedWriter writer = Files.newBufferedWriter(mergedFile, StandardCharsets.UTF_8)) {
+            boolean headerWritten = false;
+
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "*.csv")) {
+                for (Path file : stream) {
+                    List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+
+                    if (!lines.isEmpty()) {
+                        if (!headerWritten) {
+                            writer.write(lines.get(0)); // 写入第一份文件的表头
+                            writer.newLine();
+                            headerWritten = true;
+                        }
+                        // 写入正文部分（跳过第一行）
+                        for (int i = 1; i < lines.size(); i++) {
+                            writer.write(lines.get(i));
+                            writer.newLine();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
