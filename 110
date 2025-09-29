@@ -1,0 +1,74 @@
+CREATE OR REPLACE TYPE t_diff_row AS OBJECT (
+    id          NUMBER,
+    diffKeys    CLOB,
+    diffValues  CLOB,
+    hash_a      VARCHAR2(64)
+);
+/
+
+CREATE OR REPLACE TYPE t_diff_tab AS TABLE OF t_diff_row;
+/
+
+
+CREATE OR REPLACE FUNCTION get_table_diff_pipe_final(
+    p_table_a  IN VARCHAR2,
+    p_table_b  IN VARCHAR2,
+    p_id_col   IN VARCHAR2,
+    p_exclude  IN VARCHAR2 DEFAULT NULL
+) RETURN t_diff_tab PIPELINED
+AS
+    v_cols       CLOB := '';
+    v_hash_expr  CLOB := '';
+    v_unpivot_cols CLOB := '';
+    v_sql        CLOB;
+    TYPE ref_cursor IS REF CURSOR;
+    rc           ref_cursor;
+    rec          t_diff_row%ROWTYPE;
+BEGIN
+    -- 1️⃣ 自动生成对比列
+    FOR r IN (
+        SELECT column_name
+        FROM user_tab_columns
+        WHERE table_name = UPPER(p_table_a)
+          AND column_name <> UPPER(p_id_col)
+          AND (p_exclude IS NULL OR INSTR(',' || REPLACE(p_exclude,' ','') || ',', ',' || r.column_name || ',') = 0)
+        ORDER BY column_id
+    ) LOOP
+        v_cols := v_cols || '"' || r.column_name || '",';
+        v_hash_expr := v_hash_expr || 'NVL(TO_CHAR(' || r.column_name || '),''NULL'')||''|''||';
+        v_unpivot_cols := v_unpivot_cols || '"' || r.column_name || '",';
+    END LOOP;
+
+    v_cols := RTRIM(v_cols,',');
+    v_hash_expr := RTRIM(v_hash_expr,'||''|''||');
+    v_unpivot_cols := RTRIM(v_unpivot_cols,',');
+
+    -- 2️⃣ 构建动态 SQL：UNPIVOT + XMLAGG
+    v_sql := 'SELECT id, hash_a, ' ||
+             '       XMLAGG(XMLELEMENT(e, col_name || '','').EXTRACT(''//text()'')).getClobVal() AS diffKeys, ' ||
+             '       XMLAGG(XMLELEMENT(e, val_b || ''|'').EXTRACT(''//text()'')).getClobVal() AS diffValues ' ||
+             'FROM ( ' ||
+             '  SELECT a.' || p_id_col || ' AS id, ' ||
+             '         STANDARD_HASH(' || v_hash_expr || ', ''SHA256'') AS hash_a, ' ||
+             '         u.col_name, u.val_b ' ||
+             '  FROM ' || p_table_a || ' a ' ||
+             '  JOIN ' || p_table_b || ' b ON a.' || p_id_col || ' = b.' || p_id_col || ' ' ||
+             '  CROSS JOIN ' ||
+             '    UNPIVOT (val_b FOR col_name IN (' || v_unpivot_cols || ')) u ' ||
+             '  WHERE STANDARD_HASH(' || v_hash_expr || ', ''SHA256'') <> b.ITEM_HASH ' ||
+             ') diff ' ||
+             'GROUP BY id, hash_a';
+
+    -- 3️⃣ 打开游标执行
+    OPEN rc FOR v_sql;
+
+    LOOP
+        FETCH rc INTO rec.id, rec.hash_a, rec.diffKeys, rec.diffValues;
+        EXIT WHEN rc%NOTFOUND;
+        PIPE ROW(t_diff_row(rec.id, rec.diffKeys, rec.diffValues, rec.hash_a));
+    END LOOP;
+
+    CLOSE rc;
+    RETURN;
+END;
+/
